@@ -1,0 +1,429 @@
+---
+title: "开发者上手阅读路线图 - 从读懂架构到开始定制"
+description: "给准备二次开发 Claude Code / CCB 的开发者一条可执行的阅读路线。按入口、主循环、工具系统、上下文和扩展点逐步阅读，目标是读完后能上手定制化开发。"
+keywords: ["Claude Code 开发", "CCB 二次开发", "阅读路线", "定制化开发", "源码导读"]
+---
+
+## 这篇文档解决什么问题
+
+`docs/` 目录里已经有很多专题解析，但第一次接触这个项目时，最容易遇到的问题不是“没有资料”，而是“资料很多，不知道先读什么”。
+
+这篇文档的目标很明确：
+
+- 帮你在 30 分钟内建立整个项目的心智模型
+- 帮你按真实执行链路阅读源码，而不是按目录随机跳转
+- 帮你在读完之后就能开始做一次小型定制或修改
+
+如果你的目标是“看懂这个项目大概怎么运转”，读完本页即可。如果你的目标是“我要开始改它”，建议边读本页边打开对应源码。
+
+## 先建立一个正确预期
+
+在进入阅读路线之前，先记住这个仓库的 4 个现实前提：
+
+1. 这是一个逆向/反编译还原项目，不是原始工程源码。
+2. 大量 TypeScript 类型错误不代表运行时不可用，很多错误来自反编译残留。
+3. `src/entrypoints/cli.tsx` 中 `feature()` 被 polyfill 为始终返回 `false`，所以很多 Anthropic 内部特性在当前构建里是死分支。
+4. 你不应该把“修完所有类型错误”当作上手第一步，应该先抓住真实主链路。
+
+换句话说，这个项目的正确打开方式不是“先清理工程”，而是“先理解系统怎么跑起来，再挑一个稳定切口去改”。
+
+## 你要先记住的五层结构
+
+在这个仓库里，最有用的全局地图仍然是五层结构：
+
+| 层次 | 主要职责 | 关键文件 |
+|------|----------|----------|
+| 入口层 | 启动 CLI、注入运行时补丁、解析参数 | `src/entrypoints/cli.tsx`、`src/main.tsx` |
+| 交互层 | REPL 界面、输入输出、权限弹窗、消息展示 | `src/screens/REPL.tsx` |
+| 编排层 | 多轮对话、会话状态、transcript、成本追踪 | `src/QueryEngine.ts` |
+| 核心循环层 | 单轮 agentic loop、流式响应、工具执行、恢复重试 | `src/query.ts` |
+| 能力层 | 工具、上下文、权限、API provider、MCP | `src/tools.ts`、`src/Tool.ts`、`src/context.ts`、`src/services/api/claude.ts` |
+
+你可以先配合阅读 [架构全景](/docs/introduction/architecture-overview) 建立这张图，再回来继续按路线下钻。
+
+## 推荐阅读顺序
+
+不要按目录遍历。最推荐的顺序是：
+
+```text
+1. 先看“程序怎么启动”
+   cli.tsx -> main.tsx
+
+2. 再看“用户输入之后发生什么”
+   REPL.tsx -> QueryEngine.ts
+
+3. 再看“单轮 agent 怎么跑”
+   query.ts -> services/api/claude.ts
+
+4. 再看“AI 为什么能动手做事”
+   tools.ts -> Tool.ts -> 具体某个 Tool
+
+5. 最后看“为什么它知道项目上下文”
+   context.ts -> utils/claudemd.ts -> permissions / compact / memory
+```
+
+这条顺序的核心原则是：**永远优先阅读主调用链上的文件，而不是先读抽象层。**
+
+## 第一阶段：30 分钟建立全局心智模型
+
+这一阶段你只做一件事：知道“程序从哪里进、往哪里走、最后在哪里做事”。
+
+### Step 1：看入口文件
+
+先读：
+
+- `src/entrypoints/cli.tsx`
+- `src/main.tsx`
+
+阅读时只回答这 4 个问题：
+
+1. 运行时补丁在哪里注入？
+2. CLI 参数在哪里解析？
+3. REPL 是从哪里启动的？
+4. pipe 模式和交互模式在哪里分叉？
+
+你会看到：
+
+- `cli.tsx` 负责 `feature()` polyfill、全局 `MACRO` 注入和几个 fast-path
+- `main.tsx` 体量很大，但本质是在做启动编排和依赖初始化
+- 真正的“应用入口”不是某一个 React root，而是一串初始化后进入 REPL 或 headless 路径的调度
+
+如果你想配合专题页一起读，可以看：
+
+- [什么是 Claude Code](/docs/introduction/what-is-claude-code)
+- [架构全景](/docs/introduction/architecture-overview)
+
+### Step 2：看主屏幕是怎么接管交互的
+
+接着读：
+
+- `src/screens/REPL.tsx`
+
+第一次看这个文件，不要试图全部读完。它很长，而且整合了太多行为。你只需要先盯住这几件事：
+
+- 用户输入从哪里进入
+- 提交消息时如何调用 `query()` 或 `QueryEngine`
+- 工具权限确认 UI 在哪里接入
+- 消息列表在哪里渲染
+
+如果你在这一步感到“REPL 太大看不住”，这是正常的。你要做的是先把它当成“壳层”，知道它负责交互，不要在第一轮就试图拆透所有 hooks。
+
+## 第二阶段：2 小时走通主调用链
+
+这一阶段的目标是：从用户输入一句话开始，追到模型响应、工具调用和回显结束。
+
+### Step 3：看多轮对话的编排器
+
+读：
+
+- `src/QueryEngine.ts`
+
+这是一个非常适合建立系统感的文件，因为它位于 REPL 和 `query.ts` 中间，负责把“终端交互”翻译成“可持续多轮会话”。
+
+阅读重点：
+
+- `QueryEngineConfig` 里有哪些关键依赖
+- `submitMessage()` 做了哪些准备工作
+- 消息历史如何保留
+- 成本、transcript、文件历史、权限拒绝是如何穿过整个 turn 的
+
+如果你想理解“为什么不是每次都从零开始问模型”，这个文件就是答案。
+
+配套专题页：
+
+- [多轮对话管理](/docs/conversation/multi-turn)
+
+### Step 4：看单轮 agentic loop
+
+读：
+
+- `src/query.ts`
+
+这是这个项目最重要的文件之一。第一次阅读时建议只抓 4 件事：
+
+1. 一轮请求开始前做了哪些上下文预处理
+2. 流式响应是怎么被消费的
+3. tool use block 是怎么被解析并执行的
+4. 什么情况下这一轮会继续，什么情况下终止
+
+你不需要第一遍就理解所有恢复分支、预算、compact 细节。先看清这个骨架：
+
+```text
+准备上下文
+-> 调模型
+-> 收流
+-> 发现工具调用
+-> 执行工具
+-> 把工具结果回喂模型
+-> 判断是否继续
+```
+
+当你能用自己的话复述这段流程时，项目的灵魂就已经抓到了。
+
+配套专题页：
+
+- [Agentic Loop](/docs/conversation/the-loop)
+- [流式响应](/docs/conversation/streaming)
+
+### Step 5：看 API 客户端而不是只看 loop
+
+读：
+
+- `src/services/api/claude.ts`
+- `src/utils/model/providers.ts`
+
+这一层主要回答两个问题：
+
+1. 请求参数最终是怎么组装给模型的？
+2. 多 provider 是怎么抽象的？
+
+如果你未来想改默认模型、接入兼容 provider、调整 streaming 行为，这一层必须读。
+
+## 第三阶段：理解“AI 为什么能真的做事”
+
+很多人读完 `query.ts` 之后已经大致明白“循环”，但还不明白“为什么模型一句 tool use 就能让本地文件被修改”。这个问题要去工具层里找。
+
+### Step 6：先看工具注册表
+
+读：
+
+- `src/tools.ts`
+
+这个文件的价值很高，因为它能让你快速知道当前构建里到底有哪些工具是真正活着的。
+
+第一次阅读时重点关注：
+
+- `getAllBaseTools()` 注册了哪些核心工具
+- 哪些工具受 `feature()` 或 `process.env` 控制
+- MCP / Agent / Skill / Plan Mode 相关工具是怎样接进来的
+
+你会很快意识到：工具系统并不是“附属能力”，而是 Claude Code 的主能力层。
+
+### Step 7：再看统一工具接口
+
+读：
+
+- `src/Tool.ts`
+
+这个文件回答的是“一个 Tool 在系统眼里到底是什么”。你需要重点理解：
+
+- `ToolInputJSONSchema`
+- `ToolUseContext`
+- 权限、UI、状态更新、通知、文件历史这些上下文是怎么透传给工具的
+
+读懂 `ToolUseContext`，你会明白为什么一个工具不只是“一个函数”，而是运行在完整应用上下文里的能力单元。
+
+配套专题页：
+
+- [工具系统设计](/docs/tools/what-are-tools)
+
+### Step 8：精读一个具体工具
+
+只选一个，不要贪多。推荐按你的兴趣选：
+
+- 想理解 shell 能力：看 BashTool
+- 想理解代码修改：看 FileEditTool
+- 想理解多 agent：看 AgentTool
+- 想理解扩展能力：看 SkillTool 或 MCP 相关工具
+
+推荐优先级通常是：
+
+1. `src/tools/BashTool/`
+2. `src/tools/FileReadTool/` 或 `src/tools/FileEditTool/`
+3. `src/tools/AgentTool/`
+
+如果你读 BashTool，建议同时看：
+
+- [命令执行工具](/docs/tools/shell-execution)
+- [权限模型](/docs/safety/permission-model)
+- [沙箱机制](/docs/safety/sandbox)
+
+因为在 Claude Code 里，“能不能执行”和“执行时被限制成什么样”是两个不同层次的问题。
+
+## 第四阶段：理解上下文、记忆和定制入口
+
+当你明白了“怎么启动、怎么循环、怎么调工具”，下一步就是理解“它为什么知道当前项目发生了什么”。
+
+### Step 9：看上下文构建
+
+读：
+
+- `src/context.ts`
+
+重点看：
+
+- git 状态是如何注入的
+- 用户上下文和系统上下文是如何分层的
+- 当前日期、项目规则、记忆文件是如何被拼到 prompt 里的
+
+这是一个非常适合做定制化改造的切口。很多“让 agent 更像你团队里的工程师”的需求，都可以从这里开始。
+
+配套专题页：
+
+- [System Prompt](/docs/context/system-prompt)
+
+### Step 10：看项目记忆和 CLAUDE.md 发现逻辑
+
+读：
+
+- `src/utils/claudemd.ts`
+
+这是第二个非常值得优先理解的定制入口。它决定了：
+
+- 哪些 `CLAUDE.md` / `.claude/` 规则会被发现
+- 加载优先级是什么
+- `@include` 如何工作
+- 用户、项目、本地规则如何叠加
+
+如果你将来想做团队规范注入、目录级规则、私有记忆、按路径激活的开发规范，这里就是关键位置。
+
+配套专题页：
+
+- [项目记忆系统](/docs/context/project-memory)
+
+### Step 11：最后补读 compaction 和预算
+
+等你已经掌握主链路后，再读：
+
+- `docs/context/compaction.mdx`
+- `docs/context/token-budget.mdx`
+
+这两部分很重要，但不建议放在最开始看。原因很简单：它们属于“高级稳定性设计”，不是“程序先怎么工作”的第一性原理。
+
+等你已经能复述主链路后，再回来看压缩、预算、恢复机制，会容易很多。
+
+## 三条最适合上手的定制化路线
+
+当你已经读完前四个阶段，就可以开始第一次真正修改了。最推荐的不是大重构，而是选一条低风险路径切进去。
+
+### 路线 A：定制 Agent 风格和项目规则
+
+适合你想做：
+
+- 团队编码规范注入
+- 特定目录额外指令
+- 自定义系统提示词拼装
+- 更适合自己项目的上下文工程
+
+优先阅读和修改：
+
+- `src/context.ts`
+- `src/utils/claudemd.ts`
+- `src/constants/prompts.ts`
+
+这是最稳妥的上手路线，因为它通常不需要改动主循环，只是在“送给模型什么上下文”上做增强。
+
+### 路线 B：加一个自定义工具
+
+适合你想做：
+
+- 项目私有脚本工具
+- 内部 API 工具
+- 更强的 repo-aware 搜索工具
+- 某种自动修复或诊断工具
+
+优先阅读和修改：
+
+- `src/Tool.ts`
+- `src/tools.ts`
+- 参考一个现有 Tool 目录仿写
+
+这是最能快速感受到 Claude Code 架构魅力的一条路线，因为你会直接体验“给模型加一只手”是什么感觉。
+
+### 路线 C：改 REPL 交互体验
+
+适合你想做：
+
+- 更好的消息渲染
+- 更清晰的工具执行状态
+- 快捷键增强
+- 权限弹窗或计划模式体验优化
+
+优先阅读和修改：
+
+- `src/screens/REPL.tsx`
+- `src/components/`
+- `src/hooks/`
+
+这条路线最容易出可见成果，但也最容易被大文件和交叉 hooks 绕进去。建议先做非常局部的 UI 改动，不要一开始就重构 REPL。
+
+## 不建议你一上来做的事
+
+下面这些事情很容易让新人陷进去，建议延后：
+
+- 试图修完整个仓库的 TypeScript 错误
+- 先重构 `REPL.tsx`
+- 先去读所有 feature flag 分支
+- 先研究所有命令、所有工具、所有 hooks
+- 一开始就接触 swarm / coordinator / ant-only 体系
+
+这些内容不是不重要，而是它们对“先做出第一次有效修改”帮助不大。
+
+## 一个适合第一周的上手计划
+
+如果你希望“照着做就行”，下面是一条足够稳的第一周路线：
+
+### Day 1：跑通与定位
+
+- 执行 `bun install`
+- 执行 `bun run dev`
+- 观察启动流程，确认自己能进入 CLI
+- 通读 `src/entrypoints/cli.tsx` 和 `src/main.tsx`
+
+### Day 2：看交互与主循环
+
+- 通读 `src/screens/REPL.tsx` 的提交流程
+- 通读 `src/QueryEngine.ts`
+- 把用户输入到 `submitMessage()` 的路径自己画一遍
+
+### Day 3：看单轮循环与 API
+
+- 通读 `src/query.ts`
+- 阅读 `src/services/api/claude.ts`
+- 搞清楚 tool use 何时触发、何时继续下一轮
+
+### Day 4：看工具系统
+
+- 通读 `src/tools.ts`
+- 通读 `src/Tool.ts`
+- 精读一个具体工具目录
+
+### Day 5：开始第一次小改动
+
+从下面三种里选一个：
+
+- 给上下文注入一个自定义规则
+- 加一个小工具
+- 调整一个 REPL 展示细节
+
+目标不是“大改”，而是做一个能跑通、能验证、你自己讲得清的修改。
+
+## 读完后你应该具备什么能力
+
+如果你按本页路线完整走完，理想状态下你应该已经可以：
+
+- 说清楚 Claude Code 的主调用链
+- 知道一次用户输入如何变成多轮工具执行
+- 知道上下文、记忆、权限、工具分别在哪一层负责
+- 选出一个稳定切口做第一次定制开发
+- 在不全面理解整个仓库的前提下，安全地修改一部分功能
+
+这就是这份路线图最核心的目标：**不是让你“全懂”，而是让你尽快进入“可以动手，而且不容易改坏主链路”的状态。**
+
+## 建议搭配阅读的专题页
+
+如果你想把本页当成目录导航，最值得搭配的页面是：
+
+- [架构全景](/docs/introduction/architecture-overview)
+- [什么是 Claude Code](/docs/introduction/what-is-claude-code)
+- [Agentic Loop](/docs/conversation/the-loop)
+- [流式响应](/docs/conversation/streaming)
+- [多轮对话管理](/docs/conversation/multi-turn)
+- [工具系统设计](/docs/tools/what-are-tools)
+- [命令执行工具](/docs/tools/shell-execution)
+- [权限模型](/docs/safety/permission-model)
+- [沙箱机制](/docs/safety/sandbox)
+- [System Prompt](/docs/context/system-prompt)
+- [项目记忆系统](/docs/context/project-memory)
+
+如果你后续准备真正开始做二次开发，下一篇最值得补的文档通常不是“更细的源码注释”，而是一篇“第一次定制开发实战”。在这之前，这份路线图已经足够帮你走到能开工的程度。
